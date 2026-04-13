@@ -12,6 +12,22 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 API: `POST /avatar` med `file` (image) → svar: `{ success, avatar_base64, error }`
 
+## Test: hudfarge fra face → GLB
+
+Kjør pipeline lokalt og sjekk at hudfarge/material faktisk endres mellom ulike ansiktsbilder.
+
+```bash
+# Fra repo-root:
+python -m tools.test_pipeline --face "C:\path\to\face.jpg" --front "C:\path\to\body_front.jpg" --out "C:\path\to\out.glb"
+```
+
+Test kun hudfarge-apply på en eksisterende GLB:
+
+```bash
+python -m tools.test_skin_color --face "C:\path\to\face.jpg" --glb "C:\path\to\input.glb"
+# skriver <input>_skin.glb
+```
+
 ## Deploy til Railway (gratis)
 
 1. Gå til [railway.app](https://railway.app) og logg inn

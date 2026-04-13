@@ -2,11 +2,16 @@
 
 ## 1. Lokalt (testing)
 
+**Viktig:** Start backend fra `ai-backend`-mappen, ellers feiler import av `main`.
+
 ```bash
 cd ai-backend
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+For mannequin-basert avatar: kjør én gang `python download_mannequin.py` (nedlaster base mesh).  
+Deretter `python generate_default_avatar.py` for forhåndsvisning.
 
 Appen bruker `http://localhost:8000` (iOS) eller `http://10.0.2.2:8000` (Android emulator).
 

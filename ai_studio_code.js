@@ -1,142 +1,599 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   StyleSheet,
   Text,
   View,
-  Image,
   TouchableOpacity,
   ScrollView,
   Alert,
   ActivityIndicator,
+  AppState,
+  Linking,
+  Modal,
+  Pressable,
 } from 'react-native';
+import Slider from '@react-native-community/slider';
 import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
 import { AI_BACKEND_URL } from './src/config';
+import GLBViewer from './src/GLBViewer';
 
 const AVATAR_KEY = '@tryon_avatar';
+const POLL_INTERVAL_MS = 2000;
+const POLL_TIMEOUT_MS = 3 * 60 * 1000;
+const SCREEN_NAME = 'ProfileAvatar';
+const ERROR_MESSAGES = {
+  POSE_DEPENDENCY_MISSING: 'Server mangler pose-komponent (mediapipe/opencv).',
+  FEATURE_DISABLED: 'Kroppsanalyse er deaktivert.',
+  POSE_MODEL_INIT_FAILED: 'Kroppsanalyse kunne ikke initialiseres på serveren.',
+  POSE_TIMEOUT: 'Serveren er opptatt, prøv igjen.',
+  POSE_OOM: 'Serveren er opptatt, prøv igjen.',
+  POSE_IMAGE_DECODE_FAILED: 'Kunne ikke lese kroppsbildet. Prøv et annet bilde.',
+  JOB_CREATE_FAILED: 'Kunne ikke starte generering på serveren. Prøv igjen.',
+  INPUT_INVALID: 'Vennligst last opp full-body bilde.',
+};
 
-const CLOTHES = [
-  { id: null, label: 'Ingen', color: null },
-  { id: 'tshirt', label: 'T-skjorte', color: '#4A90D9' },
-  { id: 'sweater', label: 'Genser', color: '#8B7355' },
-  { id: 'hoodie', label: 'Hettegenser', color: '#2C3E50' },
-  { id: 'jacket', label: 'Jakke', color: '#1a1a1a' },
-];
+const resolveBackendError = (payload) => {
+  if (!payload) return { message: 'Generering feilet', errorCode: null, requestId: null };
+  const errorCode = payload.error_code || null;
+  const requestId = payload.request_id || null;
+  const details = payload.details || null;
+  const fallbackMessage = payload.message || payload.error || payload.detail || 'Generering feilet';
+  const message = errorCode && ERROR_MESSAGES[errorCode] ? ERROR_MESSAGES[errorCode] : fallbackMessage;
+  return { message, errorCode, requestId, details };
+};
 
 export default function App() {
   const [faceImage, setFaceImage] = useState(null);
+  const [bodyFrontImage, setBodyFrontImage] = useState(null);
+  const [bodySideImage, setBodySideImage] = useState(null);
+  const [avatarUrl, setAvatarUrl] = useState(null);
   const [aiAvatar, setAiAvatar] = useState(null);
+  const [avatarStyle, setAvatarStyle] = useState('female'); // 'male' | 'female' | 'neutral'
   const [rotation, setRotation] = useState(0);
-  const [selectedCloth, setSelectedCloth] = useState(null);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [jobStatus, setJobStatus] = useState(null);
+  const [jobProgress, setJobProgress] = useState(0);
+  const [jobProgressMessage, setJobProgressMessage] = useState('');
+  const [jobError, setJobError] = useState(null);
+  const [jobErrorCode, setJobErrorCode] = useState(null);
+  const [jobRequestId, setJobRequestId] = useState(null);
+  const [jobErrorDetails, setJobErrorDetails] = useState(null);
+  const [bodyDebug, setBodyDebug] = useState(null);
+  const [pickerNotice, setPickerNotice] = useState(null);
+  const [showFaceLikenessDebug, setShowFaceLikenessDebug] = useState(false);
+  const [permissionModal, setPermissionModal] = useState({ visible: false, kind: 'library', message: '' });
+  const pollTimeoutRef = useRef(null);
+  const pickingRef = useRef(false);
+  const pickerSessionRef = useRef(0);
+  const pickerCooldownUntilRef = useRef(0);
+  const lastPickerCloseAtRef = useRef(0);
+  const lastPickerLabelRef = useRef(null);
+  const appStateRef = useRef(AppState.currentState);
+  const [isPickingImage, setIsPickingImage] = useState(false);
+
+  const logDev = (event, payload = null) => {
+    if (!__DEV__) return;
+    if (payload === null || payload === undefined) {
+      console.log(`[${SCREEN_NAME}] ${event}`);
+      return;
+    }
+    console.log(`[${SCREEN_NAME}] ${event}`, payload);
+  };
 
   useEffect(() => {
+    logDev('screen mount');
     loadAvatar();
+    return () => {
+      if (pollTimeoutRef.current) clearTimeout(pollTimeoutRef.current);
+      logDev('screen unmount');
+    };
   }, []);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
+      const prevState = appStateRef.current;
+      appStateRef.current = nextState;
+      logDev('appState change', { prevState, nextState });
+      if (prevState !== 'active' && nextState === 'active') {
+        logDev('focus event', { screen: SCREEN_NAME });
+        if (Date.now() - lastPickerCloseAtRef.current < 4000 && lastPickerLabelRef.current) {
+          logDev('focus after picker close', { label: lastPickerLabelRef.current });
+        }
+      } else if (prevState === 'active' && nextState !== 'active') {
+        logDev('blur event', { screen: SCREEN_NAME });
+      }
+    });
+    return () => sub?.remove?.();
+  }, []);
+
+  useEffect(() => {
+    logDev('bodyFront state changed', { hasUri: !!bodyFrontImage, bodyFrontImage, isPickingImage });
+  }, [bodyFrontImage, isPickingImage]);
+
+  useEffect(() => {
+    if (loading) return;
+    const persistDraft = async () => {
+      try {
+        await AsyncStorage.setItem(AVATAR_KEY, JSON.stringify({
+          uri: faceImage || undefined,
+          bodyFront: bodyFrontImage || undefined,
+          bodySide: bodySideImage || undefined,
+          avatarUrl: avatarUrl || undefined,
+          rot: rotation,
+          ai: aiAvatar || undefined,
+          avatarStyle,
+        }));
+        logDev('draft autosaved', {
+          hasFace: !!faceImage,
+          hasBodyFront: !!bodyFrontImage,
+          hasBodySide: !!bodySideImage,
+        });
+      } catch (e) {
+        console.warn('draft autosave failed', e);
+      }
+    };
+    persistDraft();
+  }, [loading, faceImage, bodyFrontImage, bodySideImage, avatarUrl, rotation, aiAvatar, avatarStyle]);
+
+  const applyAssetToTarget = (target, uri) => {
+    if (target === 'face') {
+      setFaceImage(uri);
+      setAvatarUrl(null);
+      setAiAvatar(null);
+      return;
+    }
+    if (target === 'bodyFront') {
+      setBodyFrontImage(uri);
+      return;
+    }
+    if (target === 'bodySide') {
+      setBodySideImage(uri);
+    }
+  };
+
+  const requestPermissionOrBlock = async (kind) => {
+    try {
+      if (kind === 'camera') {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (perm?.granted) return true;
+        setPermissionModal({
+          visible: true,
+          kind: 'camera',
+          message: 'Kameratilgang kreves for å ta bilde. Åpne innstillinger og gi tilgang.',
+        });
+        return false;
+      }
+      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (perm?.granted) return true;
+      setPermissionModal({
+        visible: true,
+        kind: 'library',
+        message: 'Tilgang til bilder kreves for å velge fra bibliotek. Åpne innstillinger og gi tilgang.',
+      });
+      return false;
+    } catch (e) {
+      console.warn('permission request failed', e);
+      setPermissionModal({
+        visible: true,
+        kind,
+        message: 'Kunne ikke sjekke tillatelser. Prøv igjen eller åpne innstillinger.',
+      });
+      return false;
+    }
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const inferImageTypeFromUri = (uri) => {
+    const clean = String(uri || '').split('?')[0].toLowerCase();
+    if (clean.endsWith('.png')) return 'image/png';
+    if (clean.endsWith('.webp')) return 'image/webp';
+    if (clean.endsWith('.heic') || clean.endsWith('.heif')) return 'image/heic';
+    if (clean.endsWith('.jpg') || clean.endsWith('.jpeg')) return 'image/jpeg';
+    return 'image/jpeg';
+  };
+
+  const inferFileExtFromType = (type) => {
+    if (type === 'image/png') return '.png';
+    if (type === 'image/webp') return '.webp';
+    if (type === 'image/heic') return '.heic';
+    return '.jpg';
+  };
+
+  const prepareUploadAsset = async (uri, label) => {
+    if (!uri) return null;
+    const src = String(uri);
+    const sourceInfo = await FileSystem.getInfoAsync(src, { size: true });
+    if (!sourceInfo?.exists) {
+      throw new Error(`${label} file does not exist: ${src}`);
+    }
+    const contentType = inferImageTypeFromUri(src);
+    const ext = inferFileExtFromType(contentType);
+    const uniqueId = `${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const baseDir = FileSystem.cacheDirectory || FileSystem.documentDirectory;
+    const tempPath = `${baseDir}${label}_${uniqueId}${ext}`;
+    await FileSystem.copyAsync({ from: src, to: tempPath });
+    const normalizedUri = `${tempPath}?upload_ts=${Date.now()}`;
+    const prepared = {
+      uri: normalizedUri,
+      name: `${label}_${uniqueId}${ext}`,
+      type: contentType,
+      localPath: tempPath,
+      size: sourceInfo?.size ?? null,
+    };
+    logDev('prepared upload asset', { label, source: src, prepared });
+    return prepared;
+  };
+
+  const validatePickedAsset = async (asset) => {
+    if (!asset || typeof asset.uri !== 'string' || !asset.uri.trim()) {
+      return { valid: false, reason: 'missing_uri' };
+    }
+    const uri = asset.uri;
+    // iOS/Expo can occasionally report a transient "not exists" right after picker closes.
+    // Retry a couple of times before considering it invalid.
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        const info = await FileSystem.getInfoAsync(uri, { size: true });
+        if (info?.exists && (typeof info.size !== 'number' || info.size > 0)) {
+          return { valid: true, reason: null };
+        }
+        if (info?.exists && typeof info.size === 'number' && info.size <= 0) {
+          if (i < 2) {
+            await sleep(120);
+            continue;
+          }
+          return { valid: false, reason: 'empty_file' };
+        }
+        if (i < 2) {
+          await sleep(120);
+          continue;
+        }
+      }
+    } catch (e) {
+      logDev('file validation error', { uri, error: String(e?.message || e) });
+    }
+    // Fallback: if URI is a concrete local file/document URI, allow and let upload layer verify.
+    const isLikelyLocalUri = uri.startsWith('file://') || uri.startsWith('content://') || uri.startsWith('ph://');
+    if (isLikelyLocalUri) return { valid: true, reason: 'fallback_uri_only' };
+    return { valid: false, reason: 'file_not_found' };
+  };
+
+  const runPickerSafely = async (label, launchFn, target) => {
+    const now = Date.now();
+    if (now < pickerCooldownUntilRef.current) {
+      logDev('picker blocked (cooldown)', { label, msLeft: pickerCooldownUntilRef.current - now });
+      return;
+    }
+    if (pickingRef.current || isPickingImage) {
+      logDev('picker blocked (already picking)', { label });
+      return;
+    }
+    const startedAt = Date.now();
+    const sessionId = ++pickerSessionRef.current;
+    pickingRef.current = true;
+    setIsPickingImage(true);
+    setPickerNotice(null);
+    logDev('picker open', { label, sessionId });
+    try {
+      const result = await launchFn();
+      if (sessionId !== pickerSessionRef.current) {
+        logDev('picker stale session ignored', { label, sessionId, current: pickerSessionRef.current });
+        return;
+      }
+      logDev('picker result', {
+        label,
+        sessionId,
+        canceled: !!result?.canceled,
+        hasAssets: Array.isArray(result?.assets),
+        assetsCount: Array.isArray(result?.assets) ? result.assets.length : 0,
+        uri: result?.assets?.[0]?.uri || null,
+      });
+      if (result?.__permissionDenied) {
+        return;
+      }
+      if (!result || result.canceled) {
+        // Cancel is not an error: keep state and stay on same screen.
+        const elapsedMs = Date.now() - startedAt;
+        logDev('picker canceled', { label, elapsedMs });
+        return;
+      }
+      const asset = Array.isArray(result.assets) ? result.assets[0] : null;
+      const check = await validatePickedAsset(asset);
+      if (!check.valid) {
+        logDev('picker invalid asset', { label, reason: check.reason, asset });
+        Alert.alert('Kunne ikke lese bildet', 'Kunne ikke lese valgt bilde. Prøv igjen.');
+        return;
+      }
+      try {
+        applyAssetToTarget(target, asset.uri);
+        setPickerNotice(null);
+      } catch (e) {
+        console.warn('onValidAsset failed', e);
+        logDev('picker apply exception', { label, error: String(e?.message || e) });
+        setPickerNotice('Kunne ikke oppdatere valgt bilde.');
+      }
+    } catch (error) {
+      console.warn(`${label} picker error`, error);
+      logDev('picker exception', { label, error: String(error?.message || error) });
+      Alert.alert('Bildefeil', 'Kunne ikke åpne bildebibliotek nå. Prøv igjen.');
+    } finally {
+      lastPickerCloseAtRef.current = Date.now();
+      lastPickerLabelRef.current = label;
+      pickerCooldownUntilRef.current = Date.now() + 1200;
+      setTimeout(() => {
+        if (sessionId === pickerSessionRef.current) {
+          pickingRef.current = false;
+          setIsPickingImage(false);
+          logDev('picker close', { label, sessionId });
+        } else {
+          logDev('picker close skipped (newer session)', { label, sessionId, current: pickerSessionRef.current });
+        }
+      }, 250);
+    }
+  };
 
   const loadAvatar = async () => {
     try {
       const stored = await AsyncStorage.getItem(AVATAR_KEY);
       if (stored) {
-        const { uri, rot, cloth, ai } = JSON.parse(stored);
-        if (uri) setFaceImage(uri);
-        if (ai) setAiAvatar(ai);
-        if (rot !== undefined) setRotation(rot);
-        if (cloth) setSelectedCloth(cloth);
+        const parsed = JSON.parse(stored);
+        if (parsed.uri) setFaceImage(parsed.uri);
+        if (parsed.bodyFront) setBodyFrontImage(parsed.bodyFront);
+        if (parsed.bodySide) setBodySideImage(parsed.bodySide);
+        if (parsed.avatarUrl) setAvatarUrl(parsed.avatarUrl);
+        if (parsed.ai) setAiAvatar(parsed.ai);
+        if (parsed.rot !== undefined) setRotation(parsed.rot);
+        if (parsed.avatarStyle) setAvatarStyle(String(parsed.avatarStyle));
       }
     } catch (e) {
-      console.warn(e);
+      console.warn('loadAvatar', e);
     } finally {
       setLoading(false);
     }
   };
 
-  const pickImage = async () => {
-    const { granted } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!granted) {
-      Alert.alert('Ingen tilgang', 'Gi appen tilgang til bildene.');
-      return;
-    }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.9,
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-    });
-    if (!result.canceled) {
-      setFaceImage(result.assets[0].uri);
-      setAiAvatar(null);
-    }
+  const pickFace = async () => {
+    await runPickerSafely('face.gallery', async () => {
+      const ok = await requestPermissionOrBlock('library');
+      if (!ok) return { canceled: true, assets: [], __permissionDenied: true };
+      return await ImagePicker.launchImageLibraryAsync({
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.9,
+        mediaTypes: ['images'],
+        selectionLimit: 1,
+      });
+    }, 'face');
   };
 
-  const takePhoto = async () => {
-    const { granted } = await ImagePicker.requestCameraPermissionsAsync();
-    if (!granted) {
-      Alert.alert('Ingen tilgang', 'Gi appen tilgang til kameraet.');
-      return;
-    }
-    const result = await ImagePicker.launchCameraAsync({
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.9,
-    });
-    if (!result.canceled) {
-      setFaceImage(result.assets[0].uri);
-      setAiAvatar(null);
-    }
+  const takeFacePhoto = async () => {
+    await runPickerSafely('face.camera', async () => {
+      const ok = await requestPermissionOrBlock('camera');
+      if (!ok) return { canceled: true, assets: [], __permissionDenied: true };
+      return await ImagePicker.launchCameraAsync({
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.9,
+      });
+    }, 'face');
+  };
+
+  const pickBodyFront = async () => {
+    await runPickerSafely('bodyFront.gallery', async () => {
+      const ok = await requestPermissionOrBlock('library');
+      if (!ok) return { canceled: true, assets: [], __permissionDenied: true };
+      return await ImagePicker.launchImageLibraryAsync({
+        allowsEditing: true,
+        aspect: [3, 4],
+        quality: 0.9,
+        mediaTypes: ['images'],
+        selectionLimit: 1,
+      });
+    }, 'bodyFront');
+  };
+
+  const takeBodyFrontPhoto = async () => {
+    await runPickerSafely('bodyFront.camera', async () => {
+      const ok = await requestPermissionOrBlock('camera');
+      if (!ok) return { canceled: true, assets: [], __permissionDenied: true };
+      return await ImagePicker.launchCameraAsync({
+        allowsEditing: true,
+        aspect: [3, 4],
+        quality: 0.9,
+      });
+    }, 'bodyFront');
+  };
+
+  const pickBodySide = async () => {
+    await runPickerSafely('bodySide.gallery', async () => {
+      const ok = await requestPermissionOrBlock('library');
+      if (!ok) return { canceled: true, assets: [], __permissionDenied: true };
+      return await ImagePicker.launchImageLibraryAsync({
+        allowsEditing: true,
+        aspect: [3, 4],
+        quality: 0.9,
+        mediaTypes: ['images'],
+        selectionLimit: 1,
+      });
+    }, 'bodySide');
+  };
+
+  const pollJob = (jobId) => {
+    const start = Date.now();
+    const doPoll = async () => {
+      if (Date.now() - start > POLL_TIMEOUT_MS) {
+        setJobError('Tidsavbrudd (3 min). Prøv igjen.');
+        setGenerating(false);
+        setJobStatus('failed');
+        return;
+      }
+      try {
+        const res = await fetch(`${AI_BACKEND_URL}/avatar/jobs/${jobId}`);
+        const data = await res.json();
+        setJobStatus(data.status);
+        setJobProgress(data.progress ?? 0);
+        setJobProgressMessage(data.progress_message || '');
+        if (data.bodyDebug) {
+          setBodyDebug(data.bodyDebug);
+          if (data.bodyDebug.faceAnalysisSource && data.bodyDebug.faceAnalysisSource !== 'facemesh') {
+            setPickerNotice('Kunne ikke analysere ansikt, prøv et tydeligere bilde.');
+          }
+        }
+        if (data.error || data.error_code || data.message) {
+          const parsed = resolveBackendError(data);
+          setJobError(parsed.message);
+          setJobErrorCode(parsed.errorCode);
+          setJobRequestId(parsed.requestId);
+          setJobErrorDetails(parsed.details);
+        }
+        if (data.status === 'done' && data.avatarUrl) {
+          const url = data.avatarUrl.startsWith('http') ? data.avatarUrl : `${AI_BACKEND_URL}${data.avatarUrl}`;
+          console.log('Job completed avatarUrl:', data.avatarUrl, 'resolved:', url);
+          setAvatarUrl(url);
+          setGenerating(false);
+          setJobError(null);
+          setJobErrorCode(null);
+          setJobRequestId(null);
+          setJobErrorDetails(null);
+          return;
+        }
+        if (data.status === 'failed') {
+          const parsed = resolveBackendError(data);
+          setJobError(parsed.message);
+          setJobErrorCode(parsed.errorCode);
+          setJobRequestId(parsed.requestId);
+          setJobErrorDetails(parsed.details);
+          setAvatarUrl(null);
+          Alert.alert('Generering feilet', parsed.message);
+          setGenerating(false);
+          return;
+        }
+      } catch (e) {
+        console.warn('poll error', e);
+        setJobError('Kunne ikke sjekke status. Prøv igjen.');
+        setGenerating(false);
+        return;
+      }
+      pollTimeoutRef.current = setTimeout(doPoll, POLL_INTERVAL_MS);
+    };
+    doPoll();
   };
 
   const generateWithAI = async () => {
-    if (!faceImage) {
-      Alert.alert('Mangler fjes', 'Legg til et fjesbilde først.');
+    if (isPickingImage) {
+      Alert.alert('Vent litt', 'Bildevelgeren er fortsatt åpen.');
+      return;
+    }
+    if (!faceImage || !bodyFrontImage) {
+      Alert.alert('Mangler bilder', 'Legg til både fjes og kropp (foran) før du genererer.');
       return;
     }
     setGenerating(true);
+    setJobError(null);
+    setJobErrorCode(null);
+    setJobRequestId(null);
+    setJobErrorDetails(null);
+    setJobStatus('queued');
+    setJobProgress(0);
+    setJobProgressMessage('');
+    setBodyDebug(null);
     try {
       const form = new FormData();
-      form.append('file', {
-        uri: faceImage,
-        name: 'face.jpg',
-        type: 'image/jpeg',
-      });
-      const res = await fetch(`${AI_BACKEND_URL}/avatar`, {
+      const preparedFace = await prepareUploadAsset(faceImage, 'face');
+      const preparedBodyFront = await prepareUploadAsset(bodyFrontImage, 'body_front');
+      const preparedBodySide = bodySideImage ? await prepareUploadAsset(bodySideImage, 'body_side') : null;
+      if (!preparedFace || !preparedBodyFront) {
+        throw new Error('Mangler opplastingsdata for face/bodyFront');
+      }
+      form.append('face', { uri: preparedFace.uri, name: preparedFace.name, type: preparedFace.type });
+      form.append('bodyFront', { uri: preparedBodyFront.uri, name: preparedBodyFront.name, type: preparedBodyFront.type });
+      if (bodySideImage) {
+        form.append('bodySide', { uri: preparedBodySide.uri, name: preparedBodySide.name, type: preparedBodySide.type });
+      }
+      form.append('avatarStyle', avatarStyle || 'neutral');
+      const res = await fetch(`${AI_BACKEND_URL}/avatar/jobs`, {
         method: 'POST',
         body: form,
       });
+      logDev('avatar job create headers', {
+        requestId: res.headers?.get?.('x-request-id') || null,
+      });
       const data = await res.json();
-      if (data.success && data.avatar_base64) {
-        setAiAvatar(`data:image/png;base64,${data.avatar_base64}`);
-      } else {
-        Alert.alert('Feil', data.error || 'Kunne ikke generere avatar');
+      if (!res.ok) {
+        const parsed = resolveBackendError(data);
+        setJobError(parsed.message);
+        setJobErrorCode(parsed.errorCode);
+        setJobRequestId(parsed.requestId);
+        setJobErrorDetails(parsed.details);
+        Alert.alert('Generering feilet', parsed.message);
+        setGenerating(false);
+        return;
       }
+      const jobId = data.jobId;
+      if (!jobId) {
+        setJobError('Ingen jobb-ID fra server');
+        setGenerating(false);
+        return;
+      }
+      pollJob(jobId);
     } catch (e) {
-      Alert.alert('Feil', 'Kunne ikke nå AI-backend. Sjekk at den kjører på ' + AI_BACKEND_URL);
-    } finally {
+      console.warn('create job error', e);
+      setJobError('Kunne ikke nå server. Sjekk at backend kjører på ' + AI_BACKEND_URL);
       setGenerating(false);
     }
   };
 
-  const chooseSource = () => {
-    Alert.alert('Legg til fjes', 'Velg hvordan du vil legge til fjeset ditt:', [
+  const chooseFaceSource = () => {
+    if (isPickingImage) {
+      logDev('chooseFaceSource blocked while picking');
+      return;
+    }
+    Alert.alert('Legg til fjes', 'Velg hvordan du vil legge til fjeset:', [
       { text: 'Avbryt', style: 'cancel' },
-      { text: 'Ta selfie', onPress: takePhoto },
-      { text: 'Velg fra galleri', onPress: pickImage },
+      { text: 'Ta selfie', onPress: () => setTimeout(() => takeFacePhoto(), 150) },
+      { text: 'Velg fra galleri', onPress: () => setTimeout(() => pickFace(), 150) },
     ]);
   };
 
+  const chooseBodyFrontSource = () => {
+    if (isPickingImage) {
+      logDev('chooseBodyFrontSource blocked while picking');
+      return;
+    }
+    Alert.alert('Kropp foran', 'Full kropp foran (stå rett, hel figur):', [
+      { text: 'Avbryt', style: 'cancel' },
+      { text: 'Ta bilde', onPress: () => setTimeout(() => takeBodyFrontPhoto(), 150) },
+      { text: 'Velg fra galleri', onPress: () => setTimeout(() => pickBodyFront(), 150) },
+    ]);
+  };
+
+  const openSettingsForPermission = async () => {
+    try {
+      await Linking.openSettings();
+    } catch (e) {
+      Alert.alert('Kunne ikke åpne innstillinger', 'Åpne innstillinger manuelt og gi tilgang til bilder/kamera.');
+    }
+  };
+
   const saveAvatar = async () => {
-    if (!faceImage && !aiAvatar) {
-      Alert.alert('Mangler avatar', 'Legg til fjes eller generer med AI.');
+    if (!faceImage && !aiAvatar && !avatarUrl) {
+      Alert.alert('Mangler avatar', 'Legg til fjes og kropp, deretter generer med AI.');
       return;
     }
     try {
       await AsyncStorage.setItem(AVATAR_KEY, JSON.stringify({
         uri: faceImage,
+        bodyFront: bodyFrontImage,
+        bodySide: bodySideImage,
+        avatarUrl: avatarUrl || undefined,
         rot: rotation,
-        cloth: selectedCloth,
         ai: aiAvatar,
+        avatarStyle,
       }));
       Alert.alert('Lagret', 'Avataren din er lagret.');
     } catch (e) {
@@ -145,146 +602,220 @@ export default function App() {
   };
 
   const rot = ((rotation % 360) + 360) % 360;
+  const hasAvatar = !!(avatarUrl || faceImage || bodyFrontImage);
+  const canGenerate = faceImage && bodyFrontImage;
+  const normalizedAvatarUrl = avatarUrl
+    ? (avatarUrl.startsWith('http') ? avatarUrl : `${AI_BACKEND_URL}${avatarUrl.startsWith('/') ? '' : '/'}${avatarUrl}`)
+    : null;
+  const debugBaseMannequinUrl = `${AI_BACKEND_URL}/static/avatars/base_mannequin.glb`;
+  const glbUrl = normalizedAvatarUrl || (jobStatus === 'failed' ? null : debugBaseMannequinUrl);
+  const glbUrlWithBust = useMemo(
+    () => (glbUrl ? glbUrl + (glbUrl.includes('?') ? '&' : '?') + 't=' + Date.now() : glbUrl),
+    [glbUrl]
+  );
+  // GLBViewer preserves original materials/textures (no FORCE_SOLID).
 
   if (loading) return null;
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
+      <Modal transparent visible={!!permissionModal.visible} animationType="fade">
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Tilgang kreves</Text>
+            <Text style={styles.modalText}>{permissionModal.message}</Text>
+            <View style={styles.modalActions}>
+              <Pressable style={styles.modalBtnSecondary} onPress={() => setPermissionModal({ visible: false, kind: 'library', message: '' })}>
+                <Text style={styles.modalBtnSecondaryText}>Lukk</Text>
+              </Pressable>
+              <Pressable style={styles.modalBtnPrimary} onPress={openSettingsForPermission}>
+                <Text style={styles.modalBtnPrimaryText}>Åpne innstillinger</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       <Text style={styles.header}>Profile</Text>
       <Text style={styles.subheader}>My Avatar</Text>
 
-      <View style={[styles.avatarArea, { transform: [{ rotate: `${rotation}deg` }] }]}>
-        {aiAvatar ? (
-          <Image
-            source={{ uri: aiAvatar }}
-            style={styles.aiAvatar}
-            resizeMode="contain"
-          />
-        ) : faceImage ? (
-          <View style={styles.avatarComposite}>
-            <View style={styles.faceCircle}>
-              <Image
-                source={{ uri: faceImage }}
-                style={styles.faceImage}
-                resizeMode="cover"
-              />
+      <View style={styles.avatarArea}>
+        <GLBViewer
+          glbUrl={glbUrlWithBust}
+          rotationDeg={rot}
+          onRotationChange={(deg) => setRotation(deg)}
+          style={styles.glbViewer}
+        />
+        <Text style={styles.debugUrlText}>
+          Loading GLB: {glbUrlWithBust || '(ingen URL valgt)'}
+        </Text>
+        <Text style={styles.debugUrlText}>
+          avatarUrl state: {normalizedAvatarUrl || '(tom)'}
+        </Text>
+        {__DEV__ && bodyDebug?.measurementsPx && bodyDebug?.scales && (
+          <Text style={styles.debugUrlText}>
+            fit px: sh {bodyDebug.measurementsPx.shoulderWidthPx}, hip {bodyDebug.measurementsPx.hipWidthPx}, leg {bodyDebug.measurementsPx.legLengthPx} | scales: sh {bodyDebug.scales.shoulderWidthScale?.toFixed?.(2)}, hip {bodyDebug.scales.hipScale?.toFixed?.(2)}, leg {bodyDebug.scales.legLengthScale?.toFixed?.(2)}, torso {bodyDebug.scales.torsoLengthScale?.toFixed?.(2)}, h {bodyDebug.scales.heightScale?.toFixed?.(2)}
+          </Text>
+        )}
+        {__DEV__ && bodyDebug?.warnings?.length > 0 && (
+          <Text style={styles.debugUrlText}>
+            warnings: {bodyDebug.warnings.join(', ')} | debugDeform: {String(bodyDebug.usedDebugDeform)} | bbox after: {bodyDebug.avatar_bbox_after?.x?.toFixed?.(3)} / {bodyDebug.avatar_bbox_after?.y?.toFixed?.(3)} / {bodyDebug.avatar_bbox_after?.z?.toFixed?.(3)}
+          </Text>
+        )}
+        {__DEV__ && (bodyDebug?.skinColorRgb || bodyDebug?.sampledSkinRGB_srgb || bodyDebug?.skinMaterialsChanged) && (
+          <Text style={styles.debugUrlText}>
+            skin: rgb {bodyDebug.sampledSkinRGB_srgb ? bodyDebug.sampledSkinRGB_srgb.join?.(',') : bodyDebug.skinColorRgb?.join?.(',') || '(none)'} | src {bodyDebug.skinColorSource || '(?)'} | facePx {String(bodyDebug.numberOfPixelsUsed ?? bodyDebug.skinPixelsUsed ?? '(?)')} | bodyPx {String(bodyDebug.bodyPixelsUsed ?? bodyDebug.skinBodyPixelsUsed ?? '(?)')} | mats {Array.isArray(bodyDebug.skinMaterialsChanged) ? bodyDebug.skinMaterialsChanged.join(', ') : '(none)'} | inFace {bodyDebug.inputImageHash || '(?)'} | inFront {bodyDebug.inputImageHashBodyFront || '(?)'} | inSide {bodyDebug.inputImageHashBodySide || '(none)'} | outHash {bodyDebug.outputFileHash ? String(bodyDebug.outputFileHash).slice(0, 12) : '(?)'}
+          </Text>
+        )}
+        {__DEV__ && bodyDebug?.faceAnalysisSource ? (
+          <TouchableOpacity
+            style={styles.debugToggleBtn}
+            onPress={() => setShowFaceLikenessDebug((v) => !v)}
+          >
+            <Text style={styles.debugToggleBtnText}>
+              {showFaceLikenessDebug ? 'Skjul face-likeness debug' : 'Vis face-likeness debug'}
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+        {__DEV__ && showFaceLikenessDebug && bodyDebug?.faceAnalysisSource ? (
+          <Text style={styles.debugUrlText}>
+            face likeness: {String(bodyDebug.faceLikenessEnabled)} | method {String(bodyDebug.faceLikenessMethod || 'none')} | source {String(bodyDebug.faceAnalysisSource)} | landmarks {String(bodyDebug.faceLandmarksCount ?? 0)} | morphFound {String(!!bodyDebug.hasHeadMorphTargets)} | morphCount {String(bodyDebug.morphTargetsFoundCount ?? 0)} | morphNames {(() => { try { const names = Object.values(bodyDebug.morphTargetsByMesh || bodyDebug.morphTargetNamesByMesh || {}).flat(); return names.slice(0, 8).join(', ') || '(none)'; } catch (_) { return '(none)'; } })()} | appliedMorphs {Array.isArray(bodyDebug.morphTargetsApplied) ? bodyDebug.morphTargetsApplied.slice(0, 6).map((m) => `${m.targetName || m.target}:${Number(m.weight ?? 0).toFixed?.(2) ?? m.weight}`).join(', ') : '(none)'} | overlayApplied {String(!!bodyDebug.overlayApplied)} | overlayOpacity {Number(bodyDebug.overlayOpacity ?? 0).toFixed(2)} | beardDetected {String(!!bodyDebug.beardDetected)} | beardOpacity {Number(bodyDebug.beardOpacity ?? 0).toFixed(2)} | headMeshes {Array.isArray(bodyDebug.headMeshNames) ? bodyDebug.headMeshNames.join(', ') : '(none)'} | hairMeshes {Array.isArray(bodyDebug.hairMeshNames) ? bodyDebug.hairMeshNames.join(', ') : '(none)'} | eyeMeshes {Array.isArray(bodyDebug.eyeMeshNames) ? bodyDebug.eyeMeshNames.join(', ') : '(none)'} | skinChanged {Array.isArray(bodyDebug.skinMaterialsChanged) ? bodyDebug.skinMaterialsChanged.join(', ') : '(none)'} | skinSkipped {Array.isArray(bodyDebug.materialsSkipped) ? bodyDebug.materialsSkipped.join(', ') : '(none)'} | ratios fw/h {Number(bodyDebug.faceParams?.faceWidthHeight ?? 0).toFixed(3)}, jaw {Number(bodyDebug.faceParams?.jawWidthRatio ?? 0).toFixed(3)}, cheek {Number(bodyDebug.faceParams?.cheekboneWidthRatio ?? 0).toFixed(3)}, eye {Number(bodyDebug.faceParams?.interocularRatio ?? 0).toFixed(3)}, noseW {Number(bodyDebug.faceParams?.noseWidthRatio ?? 0).toFixed(3)}, noseL {Number(bodyDebug.faceParams?.noseLengthRatio ?? 0).toFixed(3)}, mouth {Number(bodyDebug.faceParams?.mouthWidthRatio ?? 0).toFixed(3)}
+          </Text>
+        ) : null}
+        {!normalizedAvatarUrl && (
+          <TouchableOpacity style={styles.avatarOverlay} onPress={chooseFaceSource} activeOpacity={1} disabled={isPickingImage}>
+            <View style={styles.avatarOverlayInner}>
+              <Ionicons name="person-add" size={40} color="#666" />
+              <Text style={styles.avatarOverlayText}>Legg til fjes og kropp</Text>
+              <Text style={styles.avatarOverlaySubtext}>Trykk for å starte</Text>
             </View>
-            <View style={styles.bodyWrapper}>
-              <View style={styles.avatarBody} />
-              {selectedCloth && (() => {
-                const item = CLOTHES.find((c) => c.id === selectedCloth);
-                return item?.color ? (
-                  <View
-                    style={[
-                      styles.clothOverlay,
-                      {
-                        backgroundColor: item.color,
-                        borderColor: item.color,
-                      },
-                    ]}
-                  />
-                ) : null;
-              })()}
-            </View>
-          </View>
-        ) : (
-          <TouchableOpacity style={styles.placeholder} onPress={chooseSource}>
-            <Ionicons name="person" size={80} color="#ccc" />
-            <Text style={styles.placeholderText}>Legg til fjes for å lage avatar</Text>
-            <Text style={styles.placeholderSubtext}>Trykk for å velge bilde</Text>
           </TouchableOpacity>
         )}
       </View>
 
-      {(faceImage || aiAvatar) && (
+      {generating && (
+        <View style={styles.progressRow}>
+          <ActivityIndicator size="small" color="#5856D6" />
+          <View>
+            <Text style={styles.progressText}>
+              {jobStatus === 'processing' || jobStatus === 'queued' ? `${jobProgress}%` : 'Starter...'}
+            </Text>
+            {jobProgressMessage ? (
+              <Text style={styles.progressSubtext}>{jobProgressMessage}</Text>
+            ) : null}
+          </View>
+        </View>
+      )}
+      {jobError && (
+        <View style={styles.errorRow}>
+          <Text style={styles.errorText}>{jobError}</Text>
+          {__DEV__ && jobErrorCode ? <Text style={styles.debugUrlText}>error_code: {jobErrorCode}</Text> : null}
+          {__DEV__ && jobRequestId ? <Text style={styles.debugUrlText}>request_id: {jobRequestId}</Text> : null}
+          {__DEV__ && jobErrorDetails?.exception ? (
+            <Text style={styles.debugUrlText}>exception: {String(jobErrorDetails.exception)}</Text>
+          ) : null}
+          {__DEV__ && jobErrorDetails?.stacktrace ? (
+            <Text style={styles.debugUrlText} numberOfLines={8}>
+              stacktrace: {String(jobErrorDetails.stacktrace)}
+            </Text>
+          ) : null}
+          <TouchableOpacity style={styles.retryBtn} onPress={() => { setJobError(null); setJobErrorCode(null); setJobRequestId(null); setJobErrorDetails(null); generateWithAI(); }}>
+            <Text style={styles.retryBtnText}>Prøv igjen</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+      {!!pickerNotice && (
+        <View style={styles.noticeRow}>
+          <Text style={styles.noticeText}>{pickerNotice}</Text>
+        </View>
+      )}
+
+      {hasAvatar && (
         <>
           <View style={styles.rotationRow}>
-            <Text style={styles.rotationLabel}>Rotation</Text>
+            <Text style={styles.rotationLabel}>Rotation (0–360°)</Text>
             <View style={styles.rotationControls}>
-              <TouchableOpacity
-                style={styles.arrowBtn}
-                onPress={() => setRotation((r) => r - 15)}
-              >
+              <TouchableOpacity style={styles.arrowBtn} onPress={() => setRotation((r) => (r - 15) % 360)}>
                 <Ionicons name="chevron-back" size={24} color="#333" />
               </TouchableOpacity>
-              <View style={styles.sliderTrack}>
-                <View
-                  style={[
-                    styles.sliderFill,
-                    { width: `${(rot / 360) * 100}%` },
-                  ]}
-                />
-              </View>
-              <TouchableOpacity
-                style={styles.arrowBtn}
-                onPress={() => setRotation((r) => r + 15)}
-              >
+              <Slider
+                style={styles.slider}
+                minimumValue={0}
+                maximumValue={360}
+                step={1}
+                value={rot}
+                onValueChange={(v) => setRotation(Math.round(v))}
+                minimumTrackTintColor="#007AFF"
+                maximumTrackTintColor="#e0e0e0"
+                thumbTintColor="#007AFF"
+              />
+              <TouchableOpacity style={styles.arrowBtn} onPress={() => setRotation((r) => (r + 15) % 360)}>
                 <Ionicons name="chevron-forward" size={24} color="#333" />
               </TouchableOpacity>
               <Text style={styles.degrees}>{rot}°</Text>
             </View>
           </View>
 
-          {!aiAvatar && (
-            <>
-              <Text style={styles.clothesLabel}>Prøv klær</Text>
-              <View style={styles.clothesRow}>
-            {CLOTHES.map((c) => (
-              <TouchableOpacity
-                key={c.id || 'none'}
-                style={[
-                  styles.clothBtn,
-                  selectedCloth === c.id && styles.clothBtnSelected,
-                  c.color && { backgroundColor: c.color },
-                ]}
-                onPress={() => setSelectedCloth(c.id)}
-              >
-                {c.color ? null : (
-                  <Ionicons name="shirt-outline" size={20} color="#999" />
-                )}
-                <Text
-                  style={[
-                    styles.clothBtnText,
-                    c.color && { color: '#fff' },
-                    selectedCloth === c.id && styles.clothBtnTextSelected,
-                  ]}
-                  numberOfLines={1}
-                >
-                  {c.label}
-                </Text>
-              </TouchableOpacity>
-            ))}
-              </View>
-            </>
-          )}
+          <View style={styles.guidanceRow}>
+            <TouchableOpacity style={[styles.guidanceBtn, isPickingImage && styles.guidanceBtnDisabled]} onPress={chooseFaceSource} disabled={isPickingImage}>
+              <Ionicons name="person-outline" size={20} color="#007AFF" />
+              <Text style={styles.guidanceBtnText}>Fjes</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.guidanceBtn, isPickingImage && styles.guidanceBtnDisabled]} onPress={chooseBodyFrontSource} disabled={isPickingImage}>
+              <Ionicons name="body-outline" size={20} color="#007AFF" />
+              <Text style={styles.guidanceBtnText}>Kropp foran</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.guidanceBtn, isPickingImage && styles.guidanceBtnDisabled]} onPress={pickBodySide} disabled={isPickingImage}>
+              <Ionicons name="scan-outline" size={20} color="#007AFF" />
+              <Text style={styles.guidanceBtnText}>Kropp side (valgfri)</Text>
+            </TouchableOpacity>
+          </View>
 
-          {faceImage && (
+          <View style={styles.styleRow}>
+            <Text style={styles.styleLabel}>Avatar</Text>
+            <View style={styles.styleButtons}>
+              <TouchableOpacity
+                style={[styles.styleBtn, avatarStyle === 'female' && styles.styleBtnActive]}
+                onPress={() => setAvatarStyle('female')}
+                disabled={generating}
+              >
+                <Text style={[styles.styleBtnText, avatarStyle === 'female' && styles.styleBtnTextActive]}>Female</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.styleBtn, avatarStyle === 'male' && styles.styleBtnActive]}
+                onPress={() => setAvatarStyle('male')}
+                disabled={generating}
+              >
+                <Text style={[styles.styleBtnText, avatarStyle === 'male' && styles.styleBtnTextActive]}>Male</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          {hasAvatar && (
             <TouchableOpacity
-              style={[styles.aiBtn, generating && styles.aiBtnDisabled]}
+              style={[styles.aiBtn, (generating || !canGenerate) && styles.aiBtnDisabled]}
               onPress={generateWithAI}
               disabled={generating}
             >
               {generating ? (
                 <ActivityIndicator color="#fff" size="small" />
               ) : (
-                <Text style={styles.aiBtnText}>Generer avatar med AI</Text>
+                <Text style={styles.aiBtnText}>
+                  {canGenerate ? 'Generer 3D-avatar med AI' : 'Generer 3D-avatar (legg til Kropp foran først)'}
+                </Text>
               )}
             </TouchableOpacity>
           )}
 
-          <TouchableOpacity
-            style={styles.changeBtn}
-            onPress={chooseSource}
-          >
-            <Text style={styles.changeBtnText}>Bytt fjes</Text>
+          <TouchableOpacity style={styles.changeBtn} onPress={chooseFaceSource} disabled={isPickingImage}>
+            <Text style={styles.changeBtnText}>Bytt bilder</Text>
           </TouchableOpacity>
         </>
       )}
 
       <TouchableOpacity
-        style={[styles.saveBtn, !faceImage && !aiAvatar && styles.saveBtnDisabled]}
+        style={[styles.saveBtn, !hasAvatar && styles.saveBtnDisabled]}
         onPress={saveAvatar}
-        disabled={!faceImage && !aiAvatar}
+        disabled={!hasAvatar}
       >
         <Text style={styles.saveBtnText}>Lagre avatar</Text>
       </TouchableOpacity>
@@ -293,6 +824,63 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+  },
+  modalTitle: {
+    fontSize: 18,
+    color: '#222',
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  modalText: {
+    fontSize: 14,
+    color: '#444',
+    marginBottom: 14,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+  },
+  modalActionsCol: {
+    gap: 10,
+  },
+  modalBtnPrimary: {
+    backgroundColor: '#007AFF',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  modalBtnPrimaryText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modalBtnSecondary: {
+    backgroundColor: '#f0f0f0',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  modalBtnSecondaryText: {
+    color: '#333',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   container: {
     flexGrow: 1,
     backgroundColor: '#fff',
@@ -315,10 +903,175 @@ const styles = StyleSheet.create({
   avatarArea: {
     width: '100%',
     minHeight: 360,
-    backgroundColor: '#fff',
+    backgroundColor: '#f5f5f5',
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 24,
+    position: 'relative',
+  },
+  avatarOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(255,255,255,0.85)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarOverlayInner: {
+    alignItems: 'center',
+    padding: 24,
+  },
+  avatarOverlayText: {
+    fontSize: 16,
+    color: '#333',
+    marginTop: 12,
+    fontWeight: '600',
+  },
+  avatarOverlaySubtext: {
+    fontSize: 14,
+    color: '#666',
+    marginTop: 4,
+  },
+  glbViewer: {
+    width: 280,
+    height: 360,
+  },
+  debugUrlText: {
+    marginTop: 10,
+    marginHorizontal: 16,
+    fontSize: 12,
+    color: '#222',
+    textAlign: 'center',
+  },
+  debugToggleBtn: {
+    marginTop: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    backgroundColor: '#e8f2ff',
+    borderRadius: 8,
+  },
+  debugToggleBtnText: {
+    fontSize: 12,
+    color: '#1e4f8a',
+    fontWeight: '600',
+  },
+  avatarRotateWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  progressRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginBottom: 12,
+  },
+  progressSubtext: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 2,
+  },
+  progressText: {
+    fontSize: 14,
+    color: '#666',
+  },
+  errorRow: {
+    marginHorizontal: 20,
+    marginBottom: 12,
+    padding: 12,
+    backgroundColor: '#ffebee',
+    borderRadius: 8,
+  },
+  errorText: {
+    fontSize: 14,
+    color: '#c62828',
+    marginBottom: 8,
+  },
+  noticeRow: {
+    marginHorizontal: 20,
+    marginBottom: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#e8f2ff',
+    borderRadius: 8,
+  },
+  noticeText: {
+    fontSize: 13,
+    color: '#1e4f8a',
+  },
+  retryBtn: {
+    alignSelf: 'flex-start',
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    backgroundColor: '#c62828',
+    borderRadius: 8,
+  },
+  retryBtnText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  guidanceRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: 12,
+    marginBottom: 16,
+  },
+  styleRow: {
+    width: '90%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+  },
+  styleLabel: {
+    fontSize: 14,
+    color: '#333',
+    fontWeight: '600',
+  },
+  styleButtons: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  styleBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#d0d0d0',
+    backgroundColor: '#fff',
+  },
+  styleBtnActive: {
+    borderColor: '#007AFF',
+    backgroundColor: 'rgba(0,122,255,0.08)',
+  },
+  styleBtnText: {
+    fontSize: 13,
+    color: '#333',
+    fontWeight: '600',
+  },
+  styleBtnTextActive: {
+    color: '#007AFF',
+  },
+  guidanceBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#f0f0f0',
+    borderRadius: 20,
+  },
+  guidanceBtnDisabled: {
+    opacity: 0.55,
+  },
+  guidanceBtnText: {
+    fontSize: 14,
+    color: '#007AFF',
+    fontWeight: '500',
+  },
+  slider: {
+    flex: 1,
+    height: 40,
   },
   avatarComposite: {
     alignItems: 'center',
@@ -351,51 +1104,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#e8e4e0',
     borderTopLeftRadius: 50,
     borderTopRightRadius: 50,
-  },
-  clothOverlay: {
-    position: 'absolute',
-    top: 8,
-    left: 4,
-    right: 4,
-    height: 100,
-    borderTopLeftRadius: 40,
-    borderTopRightRadius: 40,
-    borderWidth: 2,
-  },
-  clothesLabel: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#333',
-    marginBottom: 12,
-    marginTop: 8,
-  },
-  clothesRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-    gap: 10,
-    marginBottom: 24,
-    paddingHorizontal: 8,
-  },
-  clothBtn: {
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    borderRadius: 20,
-    backgroundColor: '#f0f0f0',
-    minWidth: 72,
-    alignItems: 'center',
-  },
-  clothBtnSelected: {
-    borderWidth: 2,
-    borderColor: '#007AFF',
-  },
-  clothBtnText: {
-    fontSize: 12,
-    color: '#333',
-    marginTop: 4,
-  },
-  clothBtnTextSelected: {
-    fontWeight: '600',
   },
   aiAvatar: {
     width: 280,

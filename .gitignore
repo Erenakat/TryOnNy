@@ -21,3 +21,5 @@ backend/node_modules/
 ai-backend/__pycache__/
 ai-backend/.venv/
 ai-backend/*.pyc
+ai-backend/models/
+ai-backend/uploads/
