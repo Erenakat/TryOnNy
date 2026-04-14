@@ -23,3 +23,11 @@ ai-backend/.venv/
 ai-backend/*.pyc
 ai-backend/models/
 ai-backend/uploads/
+
+# Large binaries (keep local, don't commit)
+*.exe
+makehuman-community_*.exe
+
+# Generated backend artifacts (large / per-run)
+ai-backend/static/avatars/*.glb
+ai-backend/static/debug_inputs/
