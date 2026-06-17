@@ -15,6 +15,7 @@ web-build/
 
 # Local env files
 .env*.local
+.env
 
 # Backend
 backend/node_modules/

@@ -3,6 +3,8 @@ import {
   StyleSheet,
   Text,
   View,
+  Image,
+  TextInput,
   TouchableOpacity,
   ScrollView,
   Alert,
@@ -17,6 +19,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Ionicons } from '@expo/vector-icons';
+import Svg, { Path, Circle } from 'react-native-svg';
 import { AI_BACKEND_URL } from './src/config';
 import GLBViewer from './src/GLBViewer';
 
@@ -45,6 +48,60 @@ const resolveBackendError = (payload) => {
   return { message, errorCode, requestId, details };
 };
 
+const normalizeHex = (hex) => {
+  if (!hex) return null;
+  const s = String(hex).trim();
+  if (!s) return null;
+  return s.startsWith('#') ? s.toUpperCase() : `#${s.toUpperCase()}`;
+};
+
+const polarToCartesian = (cx, cy, r, angleDeg) => {
+  const a = ((angleDeg - 90) * Math.PI) / 180;
+  return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
+};
+
+const describeDonutSegment = (cx, cy, rOuter, rInner, startAngle, endAngle) => {
+  const startOuter = polarToCartesian(cx, cy, rOuter, startAngle);
+  const endOuter = polarToCartesian(cx, cy, rOuter, endAngle);
+  const startInner = polarToCartesian(cx, cy, rInner, endAngle);
+  const endInner = polarToCartesian(cx, cy, rInner, startAngle);
+  const largeArcFlag = endAngle - startAngle <= 180 ? '0' : '1';
+  return [
+    `M ${startOuter.x} ${startOuter.y}`,
+    `A ${rOuter} ${rOuter} 0 ${largeArcFlag} 1 ${endOuter.x} ${endOuter.y}`,
+    `L ${startInner.x} ${startInner.y}`,
+    `A ${rInner} ${rInner} 0 ${largeArcFlag} 0 ${endInner.x} ${endInner.y}`,
+    'Z',
+  ].join(' ');
+};
+
+const ColorWheel = ({ colors, size = 240, ringWidth = 56 }) => {
+  const palette = Array.isArray(colors) ? colors.filter(Boolean) : [];
+  const n = Math.max(6, Math.min(palette.length || 0, 12)) || 12;
+  const filled = [];
+  for (let i = 0; i < n; i += 1) filled.push(palette[i] || '#E6E8EF');
+
+  const cx = size / 2;
+  const cy = size / 2;
+  const rOuter = size / 2;
+  const rInner = Math.max(0, rOuter - ringWidth);
+  const step = 360 / filled.length;
+
+  return (
+    <View style={styles.paletteWheelWrap}>
+      <Svg width={size} height={size}>
+        {filled.map((hex, idx) => {
+          const start = idx * step;
+          const end = start + step;
+          const d = describeDonutSegment(cx, cy, rOuter, rInner, start, end);
+          return <Path key={`seg-${idx}`} d={d} fill={hex} />;
+        })}
+        <Circle cx={cx} cy={cy} r={rInner} fill="#fff" />
+      </Svg>
+    </View>
+  );
+};
+
 export default function App() {
   const [faceImage, setFaceImage] = useState(null);
   const [bodyFrontImage, setBodyFrontImage] = useState(null);
@@ -52,6 +109,7 @@ export default function App() {
   const [avatarUrl, setAvatarUrl] = useState(null);
   const [aiAvatar, setAiAvatar] = useState(null);
   const [avatarStyle, setAvatarStyle] = useState('female'); // 'male' | 'female' | 'neutral'
+  const [activeTab, setActiveTab] = useState('avatar'); // 'avatar' | 'color'
   const [rotation, setRotation] = useState(0);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
@@ -66,6 +124,9 @@ export default function App() {
   const [pickerNotice, setPickerNotice] = useState(null);
   const [showFaceLikenessDebug, setShowFaceLikenessDebug] = useState(false);
   const [permissionModal, setPermissionModal] = useState({ visible: false, kind: 'library', message: '' });
+  const [colorAnalysisResult, setColorAnalysisResult] = useState(null);
+  const [colorAnalysisLoading, setColorAnalysisLoading] = useState(false);
+  const [colorAnalysisError, setColorAnalysisError] = useState(null);
   const pollTimeoutRef = useRef(null);
   const pickingRef = useRef(false);
   const pickerSessionRef = useRef(0);
@@ -357,6 +418,41 @@ export default function App() {
     }
   };
 
+  const analyzeFaceImage = async () => {
+    if (colorAnalysisLoading) return;
+    if (!faceImage) {
+      Alert.alert('Mangler fjesbilde', 'Legg til et fjesbilde først.');
+      return;
+    }
+    setColorAnalysisLoading(true);
+    setColorAnalysisError(null);
+    try {
+      logDev('color analyze start', { AI_BACKEND_URL });
+      const prepared = await prepareUploadAsset(faceImage, 'face_analysis');
+      if (!prepared) throw new Error('Kunne ikke lese fjesbildet.');
+      const form = new FormData();
+      form.append('image', { uri: prepared.uri, name: prepared.name, type: prepared.type });
+      form.append('productLimit', '12');
+      const res = await fetch(`${AI_BACKEND_URL}/color/analyze-image`, {
+        method: 'POST',
+        body: form,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data?.detail || data?.message || 'Ukjent feil';
+        setColorAnalysisError(String(detail));
+        setColorAnalysisLoading(false);
+        return;
+      }
+      setColorAnalysisResult(data?.analysis || null);
+    } catch (e) {
+      const msg = String(e?.message || e || 'Ukjent nettverksfeil');
+      setColorAnalysisError(`Klarte ikke å analysere bildet.\nBackend: ${AI_BACKEND_URL}\nFeil: ${msg}`);
+    } finally {
+      setColorAnalysisLoading(false);
+    }
+  };
+
   const pickFace = async () => {
     await runPickerSafely('face.gallery', async () => {
       const ok = await requestPermissionOrBlock('library');
@@ -555,7 +651,7 @@ export default function App() {
     }
     Alert.alert('Legg til fjes', 'Velg hvordan du vil legge til fjeset:', [
       { text: 'Avbryt', style: 'cancel' },
-      { text: 'Ta selfie', onPress: () => setTimeout(() => takeFacePhoto(), 150) },
+      { text: 'Ta bilde', onPress: () => setTimeout(() => takeFacePhoto(), 150) },
       { text: 'Velg fra galleri', onPress: () => setTimeout(() => pickFace(), 150) },
     ]);
   };
@@ -615,10 +711,26 @@ export default function App() {
   );
   // GLBViewer preserves original materials/textures (no FORCE_SOLID).
 
+  const colorAnalysis = useMemo(() => {
+    const rgb =
+      bodyDebug?.sampledSkinRGB_srgb ||
+      bodyDebug?.skinColorRgb ||
+      null;
+    if (!Array.isArray(rgb) || rgb.length < 3) return null;
+    const [r, g, b] = rgb.map((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return 0;
+      return Math.max(0, Math.min(255, Math.round(n)));
+    });
+    const hex = '#' + [r, g, b].map((n) => n.toString(16).padStart(2, '0')).join('').toUpperCase();
+    return { r, g, b, hex, source: bodyDebug?.skinColorSource || bodyDebug?.faceAnalysisSource || null };
+  }, [bodyDebug]);
+
   if (loading) return null;
 
   return (
-    <ScrollView contentContainerStyle={styles.container}>
+    <View style={styles.screen}>
+      <ScrollView contentContainerStyle={styles.container}>
       <Modal transparent visible={!!permissionModal.visible} animationType="fade">
         <View style={styles.modalBackdrop}>
           <View style={styles.modalCard}>
@@ -635,62 +747,196 @@ export default function App() {
           </View>
         </View>
       </Modal>
-      <Text style={styles.header}>Profile</Text>
-      <Text style={styles.subheader}>My Avatar</Text>
+      <Text style={styles.header}>Profil</Text>
 
-      <View style={styles.avatarArea}>
-        <GLBViewer
-          glbUrl={glbUrlWithBust}
-          rotationDeg={rot}
-          onRotationChange={(deg) => setRotation(deg)}
-          style={styles.glbViewer}
-        />
-        <Text style={styles.debugUrlText}>
-          Loading GLB: {glbUrlWithBust || '(ingen URL valgt)'}
-        </Text>
-        <Text style={styles.debugUrlText}>
-          avatarUrl state: {normalizedAvatarUrl || '(tom)'}
-        </Text>
-        {__DEV__ && bodyDebug?.measurementsPx && bodyDebug?.scales && (
-          <Text style={styles.debugUrlText}>
-            fit px: sh {bodyDebug.measurementsPx.shoulderWidthPx}, hip {bodyDebug.measurementsPx.hipWidthPx}, leg {bodyDebug.measurementsPx.legLengthPx} | scales: sh {bodyDebug.scales.shoulderWidthScale?.toFixed?.(2)}, hip {bodyDebug.scales.hipScale?.toFixed?.(2)}, leg {bodyDebug.scales.legLengthScale?.toFixed?.(2)}, torso {bodyDebug.scales.torsoLengthScale?.toFixed?.(2)}, h {bodyDebug.scales.heightScale?.toFixed?.(2)}
-          </Text>
-        )}
-        {__DEV__ && bodyDebug?.warnings?.length > 0 && (
-          <Text style={styles.debugUrlText}>
-            warnings: {bodyDebug.warnings.join(', ')} | debugDeform: {String(bodyDebug.usedDebugDeform)} | bbox after: {bodyDebug.avatar_bbox_after?.x?.toFixed?.(3)} / {bodyDebug.avatar_bbox_after?.y?.toFixed?.(3)} / {bodyDebug.avatar_bbox_after?.z?.toFixed?.(3)}
-          </Text>
-        )}
-        {__DEV__ && (bodyDebug?.skinColorRgb || bodyDebug?.sampledSkinRGB_srgb || bodyDebug?.skinMaterialsChanged) && (
-          <Text style={styles.debugUrlText}>
-            skin: rgb {bodyDebug.sampledSkinRGB_srgb ? bodyDebug.sampledSkinRGB_srgb.join?.(',') : bodyDebug.skinColorRgb?.join?.(',') || '(none)'} | src {bodyDebug.skinColorSource || '(?)'} | facePx {String(bodyDebug.numberOfPixelsUsed ?? bodyDebug.skinPixelsUsed ?? '(?)')} | bodyPx {String(bodyDebug.bodyPixelsUsed ?? bodyDebug.skinBodyPixelsUsed ?? '(?)')} | mats {Array.isArray(bodyDebug.skinMaterialsChanged) ? bodyDebug.skinMaterialsChanged.join(', ') : '(none)'} | inFace {bodyDebug.inputImageHash || '(?)'} | inFront {bodyDebug.inputImageHashBodyFront || '(?)'} | inSide {bodyDebug.inputImageHashBodySide || '(none)'} | outHash {bodyDebug.outputFileHash ? String(bodyDebug.outputFileHash).slice(0, 12) : '(?)'}
-          </Text>
-        )}
-        {__DEV__ && bodyDebug?.faceAnalysisSource ? (
-          <TouchableOpacity
-            style={styles.debugToggleBtn}
-            onPress={() => setShowFaceLikenessDebug((v) => !v)}
-          >
-            <Text style={styles.debugToggleBtnText}>
-              {showFaceLikenessDebug ? 'Skjul face-likeness debug' : 'Vis face-likeness debug'}
-            </Text>
-          </TouchableOpacity>
-        ) : null}
-        {__DEV__ && showFaceLikenessDebug && bodyDebug?.faceAnalysisSource ? (
-          <Text style={styles.debugUrlText}>
-            face likeness: {String(bodyDebug.faceLikenessEnabled)} | method {String(bodyDebug.faceLikenessMethod || 'none')} | source {String(bodyDebug.faceAnalysisSource)} | landmarks {String(bodyDebug.faceLandmarksCount ?? 0)} | morphFound {String(!!bodyDebug.hasHeadMorphTargets)} | morphCount {String(bodyDebug.morphTargetsFoundCount ?? 0)} | morphNames {(() => { try { const names = Object.values(bodyDebug.morphTargetsByMesh || bodyDebug.morphTargetNamesByMesh || {}).flat(); return names.slice(0, 8).join(', ') || '(none)'; } catch (_) { return '(none)'; } })()} | appliedMorphs {Array.isArray(bodyDebug.morphTargetsApplied) ? bodyDebug.morphTargetsApplied.slice(0, 6).map((m) => `${m.targetName || m.target}:${Number(m.weight ?? 0).toFixed?.(2) ?? m.weight}`).join(', ') : '(none)'} | overlayApplied {String(!!bodyDebug.overlayApplied)} | overlayOpacity {Number(bodyDebug.overlayOpacity ?? 0).toFixed(2)} | beardDetected {String(!!bodyDebug.beardDetected)} | beardOpacity {Number(bodyDebug.beardOpacity ?? 0).toFixed(2)} | headMeshes {Array.isArray(bodyDebug.headMeshNames) ? bodyDebug.headMeshNames.join(', ') : '(none)'} | hairMeshes {Array.isArray(bodyDebug.hairMeshNames) ? bodyDebug.hairMeshNames.join(', ') : '(none)'} | eyeMeshes {Array.isArray(bodyDebug.eyeMeshNames) ? bodyDebug.eyeMeshNames.join(', ') : '(none)'} | skinChanged {Array.isArray(bodyDebug.skinMaterialsChanged) ? bodyDebug.skinMaterialsChanged.join(', ') : '(none)'} | skinSkipped {Array.isArray(bodyDebug.materialsSkipped) ? bodyDebug.materialsSkipped.join(', ') : '(none)'} | ratios fw/h {Number(bodyDebug.faceParams?.faceWidthHeight ?? 0).toFixed(3)}, jaw {Number(bodyDebug.faceParams?.jawWidthRatio ?? 0).toFixed(3)}, cheek {Number(bodyDebug.faceParams?.cheekboneWidthRatio ?? 0).toFixed(3)}, eye {Number(bodyDebug.faceParams?.interocularRatio ?? 0).toFixed(3)}, noseW {Number(bodyDebug.faceParams?.noseWidthRatio ?? 0).toFixed(3)}, noseL {Number(bodyDebug.faceParams?.noseLengthRatio ?? 0).toFixed(3)}, mouth {Number(bodyDebug.faceParams?.mouthWidthRatio ?? 0).toFixed(3)}
-          </Text>
-        ) : null}
-        {!normalizedAvatarUrl && (
-          <TouchableOpacity style={styles.avatarOverlay} onPress={chooseFaceSource} activeOpacity={1} disabled={isPickingImage}>
-            <View style={styles.avatarOverlayInner}>
-              <Ionicons name="person-add" size={40} color="#666" />
-              <Text style={styles.avatarOverlayText}>Legg til fjes og kropp</Text>
-              <Text style={styles.avatarOverlaySubtext}>Trykk for å starte</Text>
-            </View>
-          </TouchableOpacity>
-        )}
+      <View style={styles.segmentedWrap}>
+        <Pressable
+          onPress={() => setActiveTab('avatar')}
+          style={[styles.segmentedItem, activeTab === 'avatar' && styles.segmentedItemActive]}
+        >
+          <Text style={[styles.segmentedText, activeTab === 'avatar' && styles.segmentedTextActive]}>Avatar</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => setActiveTab('color')}
+          style={[styles.segmentedItem, activeTab === 'color' && styles.segmentedItemActive]}
+        >
+          <Text style={[styles.segmentedText, activeTab === 'color' && styles.segmentedTextActive]}>Fargeanalyse</Text>
+        </Pressable>
       </View>
+
+      {activeTab === 'avatar' ? (
+        <>
+          <Text style={styles.subheader}>My Avatar</Text>
+          <View style={styles.avatarArea}>
+            <GLBViewer
+              glbUrl={glbUrlWithBust}
+              rotationDeg={rot}
+              onRotationChange={(deg) => setRotation(deg)}
+              style={styles.glbViewer}
+            />
+            <Text style={styles.debugUrlText}>
+              Loading GLB: {glbUrlWithBust || '(ingen URL valgt)'}
+            </Text>
+            <Text style={styles.debugUrlText}>
+              avatarUrl state: {normalizedAvatarUrl || '(tom)'}
+            </Text>
+            {__DEV__ && bodyDebug?.measurementsPx && bodyDebug?.scales && (
+              <Text style={styles.debugUrlText}>
+                fit px: sh {bodyDebug.measurementsPx.shoulderWidthPx}, hip {bodyDebug.measurementsPx.hipWidthPx}, leg {bodyDebug.measurementsPx.legLengthPx} | scales: sh {bodyDebug.scales.shoulderWidthScale?.toFixed?.(2)}, hip {bodyDebug.scales.hipScale?.toFixed?.(2)}, leg {bodyDebug.scales.legLengthScale?.toFixed?.(2)}, torso {bodyDebug.scales.torsoLengthScale?.toFixed?.(2)}, h {bodyDebug.scales.heightScale?.toFixed?.(2)}
+              </Text>
+            )}
+            {__DEV__ && bodyDebug?.warnings?.length > 0 && (
+              <Text style={styles.debugUrlText}>
+                warnings: {bodyDebug.warnings.join(', ')} | debugDeform: {String(bodyDebug.usedDebugDeform)} | bbox after: {bodyDebug.avatar_bbox_after?.x?.toFixed?.(3)} / {bodyDebug.avatar_bbox_after?.y?.toFixed?.(3)} / {bodyDebug.avatar_bbox_after?.z?.toFixed?.(3)}
+              </Text>
+            )}
+            {__DEV__ && (bodyDebug?.skinColorRgb || bodyDebug?.sampledSkinRGB_srgb || bodyDebug?.skinMaterialsChanged) && (
+              <Text style={styles.debugUrlText}>
+                skin: rgb {bodyDebug.sampledSkinRGB_srgb ? bodyDebug.sampledSkinRGB_srgb.join?.(',') : bodyDebug.skinColorRgb?.join?.(',') || '(none)'} | src {bodyDebug.skinColorSource || '(?)'} | facePx {String(bodyDebug.numberOfPixelsUsed ?? bodyDebug.skinPixelsUsed ?? '(?)')} | bodyPx {String(bodyDebug.bodyPixelsUsed ?? bodyDebug.skinBodyPixelsUsed ?? '(?)')} | mats {Array.isArray(bodyDebug.skinMaterialsChanged) ? bodyDebug.skinMaterialsChanged.join(', ') : '(none)'} | inFace {bodyDebug.inputImageHash || '(?)'} | inFront {bodyDebug.inputImageHashBodyFront || '(?)'} | inSide {bodyDebug.inputImageHashBodySide || '(none)'} | outHash {bodyDebug.outputFileHash ? String(bodyDebug.outputFileHash).slice(0, 12) : '(?)'}
+              </Text>
+            )}
+            {__DEV__ && bodyDebug?.faceAnalysisSource ? (
+              <TouchableOpacity
+                style={styles.debugToggleBtn}
+                onPress={() => setShowFaceLikenessDebug((v) => !v)}
+              >
+                <Text style={styles.debugToggleBtnText}>
+                  {showFaceLikenessDebug ? 'Skjul face-likeness debug' : 'Vis face-likeness debug'}
+                </Text>
+              </TouchableOpacity>
+            ) : null}
+            {__DEV__ && showFaceLikenessDebug && bodyDebug?.faceAnalysisSource ? (
+              <Text style={styles.debugUrlText}>
+                face likeness: {String(bodyDebug.faceLikenessEnabled)} | method {String(bodyDebug.faceLikenessMethod || 'none')} | source {String(bodyDebug.faceAnalysisSource)} | landmarks {String(bodyDebug.faceLandmarksCount ?? 0)} | morphFound {String(!!bodyDebug.hasHeadMorphTargets)} | morphCount {String(bodyDebug.morphTargetsFoundCount ?? 0)} | morphNames {(() => { try { const names = Object.values(bodyDebug.morphTargetsByMesh || bodyDebug.morphTargetNamesByMesh || {}).flat(); return names.slice(0, 8).join(', ') || '(none)'; } catch (_) { return '(none)'; } })()} | appliedMorphs {Array.isArray(bodyDebug.morphTargetsApplied) ? bodyDebug.morphTargetsApplied.slice(0, 6).map((m) => `${m.targetName || m.target}:${Number(m.weight ?? 0).toFixed?.(2) ?? m.weight}`).join(', ') : '(none)'} | overlayApplied {String(!!bodyDebug.overlayApplied)} | overlayOpacity {Number(bodyDebug.overlayOpacity ?? 0).toFixed(2)} | beardDetected {String(!!bodyDebug.beardDetected)} | beardOpacity {Number(bodyDebug.beardOpacity ?? 0).toFixed(2)} | headMeshes {Array.isArray(bodyDebug.headMeshNames) ? bodyDebug.headMeshNames.join(', ') : '(none)'} | hairMeshes {Array.isArray(bodyDebug.hairMeshNames) ? bodyDebug.hairMeshNames.join(', ') : '(none)'} | eyeMeshes {Array.isArray(bodyDebug.eyeMeshNames) ? bodyDebug.eyeMeshNames.join(', ') : '(none)'} | skinChanged {Array.isArray(bodyDebug.skinMaterialsChanged) ? bodyDebug.skinMaterialsChanged.join(', ') : '(none)'} | skinSkipped {Array.isArray(bodyDebug.materialsSkipped) ? bodyDebug.materialsSkipped.join(', ') : '(none)'} | ratios fw/h {Number(bodyDebug.faceParams?.faceWidthHeight ?? 0).toFixed(3)}, jaw {Number(bodyDebug.faceParams?.jawWidthRatio ?? 0).toFixed(3)}, cheek {Number(bodyDebug.faceParams?.cheekboneWidthRatio ?? 0).toFixed(3)}, eye {Number(bodyDebug.faceParams?.interocularRatio ?? 0).toFixed(3)}, noseW {Number(bodyDebug.faceParams?.noseWidthRatio ?? 0).toFixed(3)}, noseL {Number(bodyDebug.faceParams?.noseLengthRatio ?? 0).toFixed(3)}, mouth {Number(bodyDebug.faceParams?.mouthWidthRatio ?? 0).toFixed(3)}
+              </Text>
+            ) : null}
+            {!normalizedAvatarUrl && (
+              <TouchableOpacity style={styles.avatarOverlay} onPress={chooseFaceSource} activeOpacity={1} disabled={isPickingImage}>
+                <View style={styles.avatarOverlayInner}>
+                  <Ionicons name="person-add" size={40} color="#666" />
+                  <Text style={styles.avatarOverlayText}>Legg til fjes og kropp</Text>
+                  <Text style={styles.avatarOverlaySubtext}>Trykk for å starte</Text>
+                </View>
+              </TouchableOpacity>
+            )}
+          </View>
+        </>
+      ) : (
+        <>
+          <View style={styles.colorCard}>
+            <Text style={styles.colorTitle}>Fargeanalyse</Text>
+            {faceImage ? (
+              <View style={styles.facePreviewRow}>
+                <View style={styles.faceThumbWrap}>
+                  <Image source={{ uri: faceImage }} style={styles.faceThumb} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.colorMetaText}>Bruker fjesbildet ditt</Text>
+                  <Text style={styles.colorMetaSubtext}>Velg “Bytt bilde” hvis du vil bruke et annet bilde.</Text>
+                </View>
+              </View>
+            ) : (
+              <Text style={styles.colorEmptyText}>
+                Last opp et fjesbilde for å få fargeanalyse + produktforslag.
+              </Text>
+            )}
+
+            <TouchableOpacity
+              style={[styles.aiBtn, (colorAnalysisLoading || !faceImage) && styles.aiBtnDisabled, styles.colorCta]}
+              onPress={analyzeFaceImage}
+              disabled={colorAnalysisLoading || !faceImage}
+            >
+              {colorAnalysisLoading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.aiBtnText}>
+                  {faceImage ? 'Analyser fjesbilde' : 'Legg til fjesbilde først'}
+                </Text>
+              )}
+            </TouchableOpacity>
+
+            <View style={styles.faceActionsRow}>
+              <TouchableOpacity style={styles.smallActionBtn} onPress={chooseFaceSource} disabled={isPickingImage}>
+                <Ionicons name="image-outline" size={18} color="#007AFF" />
+                <Text style={styles.smallActionText}>Bytt bilde</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.smallActionBtn} onPress={() => { setColorAnalysisResult(null); setColorAnalysisError(null); }}>
+                <Ionicons name="trash-outline" size={18} color="#007AFF" />
+                <Text style={styles.smallActionText}>Tøm</Text>
+              </TouchableOpacity>
+            </View>
+
+            {!!colorAnalysisError && (
+              <View style={styles.inlineErrorRow}>
+                <Text style={styles.inlineErrorText}>{colorAnalysisError}</Text>
+              </View>
+            )}
+
+            {!!colorAnalysisResult && (
+              <View style={styles.analysisBlock}>
+                {!!faceImage && (
+                  <View style={styles.analysisFaceImageWrap}>
+                    <Image source={{ uri: faceImage }} style={styles.analysisFaceImage} />
+                  </View>
+                )}
+                <Text style={styles.analysisTitle}>Resultat</Text>
+                <Text style={styles.analysisLine}>Undertone: {String(colorAnalysisResult.undertone || '-')}</Text>
+                <Text style={styles.analysisLine}>Kontrast: {String(colorAnalysisResult.contrast || '-')}</Text>
+                <Text style={styles.analysisLine}>Sesong: {String(colorAnalysisResult.season || '-')}</Text>
+                <Text style={styles.analysisLine}>Undersesong: {String(colorAnalysisResult.subseason || '-')}</Text>
+
+                <View style={styles.paletteSection}>
+                  <Text style={styles.analysisTitle}>Fargepalett</Text>
+                  <ColorWheel
+                    colors={[
+                      ...(Array.isArray(colorAnalysisResult.best_colors)
+                        ? colorAnalysisResult.best_colors.map((c) => normalizeHex(c?.hex)).filter(Boolean)
+                        : []),
+                      ...(Array.isArray(colorAnalysisResult.avoid_colors)
+                        ? colorAnalysisResult.avoid_colors.map((c) => normalizeHex(c?.hex)).filter(Boolean)
+                        : []),
+                    ].slice(0, 12)}
+                    size={260}
+                    ringWidth={64}
+                  />
+                </View>
+
+                {Array.isArray(colorAnalysisResult.best_colors) && colorAnalysisResult.best_colors.length > 0 ? (
+                  <View style={[styles.colorsSection, styles.bestColorsSection]}>
+                    <Text style={styles.analysisSubtitle}>Beste farger</Text>
+                    <View style={styles.colorChipsRow}>
+                      {colorAnalysisResult.best_colors.slice(0, 8).map((c, idx) => (
+                        <View key={`best-${idx}`} style={styles.colorChip}>
+                          <View style={[styles.colorDot, { backgroundColor: c?.hex || '#ccc' }]} />
+                          <Text style={styles.colorChipText}>{String(c?.name || '')}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                ) : null}
+
+                {Array.isArray(colorAnalysisResult.avoid_colors) && colorAnalysisResult.avoid_colors.length > 0 ? (
+                  <View style={[styles.colorsSection, styles.avoidColorsSection]}>
+                    <Text style={styles.analysisSubtitle}>Farger å unngå</Text>
+                    <View style={styles.colorChipsRow}>
+                      {colorAnalysisResult.avoid_colors.slice(0, 8).map((c, idx) => (
+                        <View key={`avoid-${idx}`} style={styles.colorChip}>
+                          <View style={[styles.colorDot, { backgroundColor: c?.hex || '#ccc' }]} />
+                          <Text style={styles.colorChipText}>{String(c?.name || '')}</Text>
+                        </View>
+                      ))}
+                    </View>
+                  </View>
+                ) : null}
+
+              </View>
+            )}
+
+            {null}
+          </View>
+
+        </>
+      )}
 
       {generating && (
         <View style={styles.progressRow}>
@@ -729,7 +975,7 @@ export default function App() {
         </View>
       )}
 
-      {hasAvatar && (
+      {activeTab === 'avatar' && hasAvatar && (
         <>
           <View style={styles.rotationRow}>
             <Text style={styles.rotationLabel}>Rotation (0–360°)</Text>
@@ -819,7 +1065,23 @@ export default function App() {
       >
         <Text style={styles.saveBtnText}>Lagre avatar</Text>
       </TouchableOpacity>
-    </ScrollView>
+      </ScrollView>
+
+      <View style={styles.bottomNav}>
+        <TouchableOpacity style={styles.bottomNavItem} onPress={() => Alert.alert('Favoritter', 'Kommer snart')}>
+          <Ionicons name="heart-outline" size={22} color="#111" />
+          <Text style={styles.bottomNavText}>Favoritter</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.bottomNavItem} onPress={() => Alert.alert('Butikk', 'Kommer snart')}>
+          <Ionicons name="bag-outline" size={22} color="#111" />
+          <Text style={styles.bottomNavText}>Butikk</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.bottomNavItem, styles.bottomNavItemActive]} onPress={() => {}}>
+          <Ionicons name="person" size={22} color="#111" />
+          <Text style={styles.bottomNavText}>Profil</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
   );
 }
 
@@ -881,12 +1143,45 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
   },
+  screen: {
+    flex: 1,
+    backgroundColor: '#fff',
+  },
   container: {
     flexGrow: 1,
     backgroundColor: '#fff',
     alignItems: 'center',
     paddingTop: 50,
-    paddingBottom: 40,
+    paddingBottom: 120,
+  },
+  bottomNav: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingBottom: 24,
+    paddingTop: 10,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    backgroundColor: '#fff',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(0,0,0,0.08)',
+  },
+  bottomNavItem: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 6,
+  },
+  bottomNavItemActive: {
+    opacity: 1,
+  },
+  bottomNavText: {
+    marginTop: 4,
+    fontSize: 10,
+    color: '#111',
+    fontWeight: '600',
   },
   header: {
     fontSize: 24,
@@ -900,6 +1195,39 @@ const styles = StyleSheet.create({
     marginBottom: 24,
     fontWeight: '600',
   },
+  segmentedWrap: {
+    width: '92%',
+    maxWidth: 360,
+    flexDirection: 'row',
+    backgroundColor: '#efeff4',
+    borderRadius: 16,
+    padding: 4,
+    marginTop: 12,
+    marginBottom: 18,
+  },
+  segmentedItem: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  segmentedItemActive: {
+    backgroundColor: '#fff',
+    shadowColor: '#000',
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 2,
+  },
+  segmentedText: {
+    fontSize: 14,
+    color: '#6b6b6b',
+    fontWeight: '600',
+  },
+  segmentedTextActive: {
+    color: '#111',
+  },
   avatarArea: {
     width: '100%',
     minHeight: 360,
@@ -908,6 +1236,194 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingVertical: 24,
     position: 'relative',
+  },
+  colorCard: {
+    width: '92%',
+    maxWidth: 420,
+    backgroundColor: '#f7f7fb',
+    borderRadius: 16,
+    padding: 16,
+    marginTop: 56,
+    marginBottom: 14,
+  },
+  colorTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#222',
+    marginBottom: 12,
+  },
+  colorRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginBottom: 12,
+  },
+  colorSwatch: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.08)',
+  },
+  colorMeta: {
+    flex: 1,
+  },
+  colorMetaText: {
+    fontSize: 14,
+    color: '#222',
+    fontWeight: '600',
+  },
+  colorMetaSubtext: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 2,
+  },
+  colorEmptyText: {
+    fontSize: 14,
+    color: '#444',
+    lineHeight: 20,
+    marginBottom: 12,
+  },
+  colorCta: {
+    marginTop: 2,
+  },
+  facePreviewRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginBottom: 12,
+  },
+  faceThumbWrap: {
+    width: 52,
+    height: 52,
+    borderRadius: 14,
+    overflow: 'hidden',
+    backgroundColor: '#eee',
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.08)',
+  },
+  faceThumb: {
+    width: '100%',
+    height: '100%',
+  },
+  faceActionsRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 6,
+    marginBottom: 6,
+  },
+  smallActionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#fff',
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.08)',
+  },
+  smallActionText: {
+    fontSize: 13,
+    color: '#007AFF',
+    fontWeight: '600',
+  },
+  inlineErrorRow: {
+    marginTop: 8,
+    padding: 10,
+    backgroundColor: '#ffebee',
+    borderRadius: 10,
+  },
+  inlineErrorText: {
+    fontSize: 13,
+    color: '#c62828',
+    fontWeight: '600',
+  },
+  analysisBlock: {
+    marginTop: 12,
+    padding: 12,
+    backgroundColor: '#fff',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.06)',
+  },
+  analysisFaceImageWrap: {
+    width: '100%',
+    borderRadius: 58,
+    overflow: 'hidden',
+    backgroundColor: 'transparent',
+    marginBottom: 18,
+  },
+  analysisFaceImage: {
+    width: '100%',
+    height: 260,
+    resizeMode: 'contain',
+    borderRadius: 58,
+    backgroundColor: 'transparent',
+  },
+  analysisTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#222',
+    marginBottom: 8,
+  },
+  analysisSubtitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#222',
+    marginBottom: 8,
+  },
+  analysisLine: {
+    fontSize: 13,
+    color: '#333',
+    marginBottom: 4,
+    fontWeight: '600',
+  },
+  paletteSection: {
+    marginTop: 40,
+    alignItems: 'center',
+  },
+  paletteWheelWrap: {
+    marginTop: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  colorsSection: {
+    marginTop: 10,
+  },
+  bestColorsSection: {
+    marginTop: 40,
+  },
+  avoidColorsSection: {
+    marginTop: 30,
+  },
+  colorChipsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  colorChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    backgroundColor: '#f7f7fb',
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.06)',
+  },
+  colorDot: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.12)',
+  },
+  colorChipText: {
+    fontSize: 12,
+    color: '#222',
+    fontWeight: '700',
   },
   avatarOverlay: {
     ...StyleSheet.absoluteFillObject,
@@ -1147,7 +1663,8 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   rotationRow: {
-    width: '90%',
+    width: '92%',
+    maxWidth: 420,
     marginTop: 8,
     marginBottom: 24,
   },
@@ -1158,6 +1675,7 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   rotationControls: {
+    width: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,

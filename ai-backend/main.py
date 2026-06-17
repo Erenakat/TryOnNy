@@ -4,6 +4,8 @@ Endpoints: POST /avatar/jobs, GET /avatar/jobs/:jobId
 Bruk: uvicorn main:app --host 0.0.0.0 --port 8000
 """
 import io
+import json
+import re
 import base64
 import uuid
 import threading
@@ -12,6 +14,7 @@ import hashlib
 import traceback
 import os
 import time
+import math
 from collections import deque
 from pathlib import Path
 
@@ -23,11 +26,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import cv2
 import numpy as np
+from openai import OpenAI, BadRequestError
+from PIL import Image
+from dotenv import load_dotenv
 
 from jobs import create_job, get_job, update_job, JobStatus
 from pipeline import run_pipeline, get_face_region, ensure_models_loaded, _decode_image_bytes, debug_mannequin_morphs  # type: ignore
 from errors import AppError, error_response_payload, is_dev_mode, classify_pose_exception, sanitize_for_json
 from pose_service import pose_service
+from product_feed import load_products
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,6 +48,10 @@ app.add_middleware(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# Load local .env from ai-backend/ regardless of cwd. Safe no-op if missing.
+load_dotenv(dotenv_path=BASE_DIR / ".env")
+
 UPLOADS_DIR = BASE_DIR / "uploads"
 AVATARS_DIR = BASE_DIR / "static" / "avatars"
 DEBUG_INPUTS_DIR = BASE_DIR / "static" / "debug_inputs"
@@ -50,6 +61,160 @@ DEBUG_INPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 _recent_errors_by_request_id: dict[str, dict] = {}
 _recent_uploads: deque[dict] = deque(maxlen=200)
+
+
+class ColorChatRequest(BaseModel):
+    message: str
+    rgb: list[int] | None = None
+    hex: str | None = None
+    source: str | None = None
+    history: list[dict] | None = None
+    # Optional: allow client to send key (dev-only / self-hosted setups).
+    api_key: str | None = None
+
+
+def _get_openai_api_key(request: Request | None = None, payload_api_key: str | None = None) -> str | None:
+    """
+    Priority:
+      1) Request header: x-openai-key
+      2) Payload field: api_key
+      3) Environment: OPENAI_API_KEY / OPENAI_APIKEY
+    """
+    if request is not None:
+        hdr = request.headers.get("x-openai-key") or request.headers.get("X-OpenAI-Key")
+        if hdr and isinstance(hdr, str) and hdr.strip():
+            return hdr.strip()
+    if payload_api_key and isinstance(payload_api_key, str) and payload_api_key.strip():
+        return payload_api_key.strip()
+    return os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_APIKEY")
+
+
+def _require_openai_api_key(api_key: str | None) -> str:
+    if api_key and isinstance(api_key, str) and api_key.strip():
+        return api_key.strip()
+    raise HTTPException(
+        status_code=400,
+        detail="Mangler OpenAI API key. Send `x-openai-key` (header) / `apiKey` (form) eller sett `OPENAI_API_KEY` på serveren.",
+    )
+
+
+def _parse_hex_color(value: str | None) -> tuple[int, int, int] | None:
+    if not value:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.startswith("#"):
+        s = s[1:]
+    if len(s) == 3:
+        s = "".join([c * 2 for c in s])
+    if len(s) != 6:
+        return None
+    try:
+        r = int(s[0:2], 16)
+        g = int(s[2:4], 16)
+        b = int(s[4:6], 16)
+        return (r, g, b)
+    except Exception:
+        return None
+
+
+def _rgb_dist(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
+
+
+def _extract_best_hexes(analysis: dict) -> list[str]:
+    try:
+        colors = analysis.get("best_colors")
+        if not isinstance(colors, list):
+            return []
+        out: list[str] = []
+        for c in colors:
+            if not isinstance(c, dict):
+                continue
+            hx = c.get("hex")
+            if not isinstance(hx, str):
+                continue
+            hx = hx.strip()
+            if not hx:
+                continue
+            if not hx.startswith("#"):
+                hx = "#" + hx
+            out.append(hx.upper())
+        seen = set()
+        uniq = []
+        for hx in out:
+            if hx in seen:
+                continue
+            seen.add(hx)
+            uniq.append(hx)
+        return uniq
+    except Exception:
+        return []
+
+
+def _rank_products_by_palette(products: list[dict], best_hexes: list[str], limit: int) -> list[dict]:
+    limit = max(1, min(int(limit or 12), 50))
+    if not products:
+        return []
+    if not best_hexes:
+        return products[:limit]
+
+    palette_rgb = [(_parse_hex_color(hx), hx) for hx in best_hexes]
+    palette_rgb = [(rgb, hx) for (rgb, hx) in palette_rgb if rgb is not None]
+    if not palette_rgb:
+        return products[:limit]
+
+    scored: list[tuple[float, dict]] = []
+    for p in products:
+        prgb = _parse_hex_color(p.get("color_hex"))
+        if prgb is None:
+            scored.append((1e9, p))
+            continue
+        d = min(_rgb_dist(prgb, rgb) for (rgb, _) in palette_rgb)
+        scored.append((d, p))
+
+    scored.sort(key=lambda t: t[0])
+
+    picked: list[dict] = []
+    used_titles: set[str] = set()
+    used_categories: set[str] = set()
+    used_hex: set[str] = set()
+
+    for _, p in scored:
+        if len(picked) >= limit:
+            break
+        title = str(p.get("title") or "").strip()
+        if title and title in used_titles:
+            continue
+        cat = str(p.get("category") or "").strip().lower()
+        hx = str(p.get("color_hex") or "").strip().upper()
+        if hx and not hx.startswith("#"):
+            hx = "#" + hx
+
+        if len(products) >= 8:
+            if cat and cat in used_categories and len(used_categories) < 4:
+                continue
+            if hx and hx in used_hex and len(used_hex) < 6:
+                continue
+
+        picked.append(p)
+        if title:
+            used_titles.add(title)
+        if cat:
+            used_categories.add(cat)
+        if hx:
+            used_hex.add(hx)
+
+    if len(picked) < limit:
+        for _, p in scored:
+            if len(picked) >= limit:
+                break
+            if p in picked:
+                continue
+            picked.append(p)
+
+    return picked
 
 
 def _remember_error(request_id: str, payload: dict) -> None:
@@ -90,6 +255,256 @@ async def request_id_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Request-Id"] = request_id
     return response
+
+
+@app.post("/color/chat")
+async def color_chat(payload: ColorChatRequest, request: Request):
+    """
+    Proxy for "Fargeanalyse"-chat. Reads OPENAI_API_KEY from environment.
+    Returns: { reply: string }
+    """
+    request_id = _get_request_id(request)
+    api_key = _require_openai_api_key(_get_openai_api_key(request, payload.api_key))
+
+    msg = (payload.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="Mangler message.")
+
+    client = OpenAI(api_key=api_key)
+
+    color_ctx = {
+        "rgb": payload.rgb,
+        "hex": payload.hex,
+        "source": payload.source,
+    }
+
+    system = (
+        "Du er en hjelpsom stylist og fargeanalytiker. "
+        "Svar på norsk. Vær konkret og kort. "
+        "Gi forslag til farger som passer (klær, hår, sminke) basert på hudtone-data når tilgjengelig. "
+        "Hvis data mangler, be om et tydelig fjes + kropp-bilde og foreslå neste steg."
+    )
+
+    messages = [{"role": "system", "content": system}]
+    if payload.history and isinstance(payload.history, list):
+        # Expect items like {role, content}. Keep it small.
+        for item in payload.history[-8:]:
+            try:
+                role = item.get("role")
+                content = item.get("content")
+                if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                    messages.append({"role": role, "content": content.strip()[:1500]})
+            except Exception:
+                continue
+
+    if any(v is not None for v in color_ctx.values()):
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Kontekst (fra app): {sanitize_for_json(color_ctx)}",
+            }
+        )
+
+    messages.append({"role": "user", "content": msg[:2000]})
+
+    try:
+        resp = client.chat.completions.create(
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=messages,
+            temperature=0.4,
+        )
+        reply = (resp.choices[0].message.content or "").strip()
+        if not reply:
+            reply = "Jeg fikk ikke noe svar tilbake. Prøv igjen."
+        return {"reply": reply, "request_id": request_id}
+    except Exception as e:
+        logger.exception("color_chat failed request_id=%s", request_id)
+        _remember_error(
+            request_id,
+            {"error_code": "COLOR_CHAT_FAILED", "message": "color chat failed", "details": {"exception": str(e)}},
+        )
+        raise HTTPException(status_code=502, detail="Fargeanalyse-chat feilet. Sjekk server-loggene.")
+
+
+class ColorAnalyzeResponse(BaseModel):
+    request_id: str
+    analysis: dict
+    products: list[dict]
+
+
+def _parse_json_object_from_llm(text: str) -> dict:
+    """OpenAI returnerer ofte JSON omgitt av markdown; trekk ut objektet vi trenger."""
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("Tomt svar fra modellen.")
+    try:
+        out = json.loads(raw)
+    except json.JSONDecodeError:
+        out = None
+    if isinstance(out, dict):
+        return out
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw, re.IGNORECASE)
+    if m:
+        try:
+            out = json.loads(m.group(1).strip())
+            if isinstance(out, dict):
+                return out
+        except json.JSONDecodeError:
+            pass
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            out = json.loads(raw[start : end + 1])
+            if isinstance(out, dict):
+                return out
+        except json.JSONDecodeError:
+            pass
+    raise ValueError("Kunne ikke parse JSON-objekt fra modellens svar.")
+
+
+def _bytes_for_openai_vision(img_bytes: bytes, content_type: str | None) -> tuple[bytes, str]:
+    """
+    OpenAI Vision støtter pålitelig JPEG/PNG/GIF/WebP i data-URL.
+    HEIC/HEIF fra iOS (og andre rare MIME-typer) dekodes til JPEG via Pillow + pillow-heif.
+    """
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct == "image/jpg":
+        ct = "image/jpeg"
+    if ct in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+        return img_bytes, ct
+
+    try:
+        try:
+            import pillow_heif  # type: ignore
+
+            pillow_heif.register_heif_opener()
+        except ImportError:
+            pass
+        im = Image.open(io.BytesIO(img_bytes))
+        if im.mode in ("RGBA", "P"):
+            im = im.convert("RGB")
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=90, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+    except Exception as exc:
+        extra = ""
+        if ct in ("image/heic", "image/heif"):
+            extra = " Sørg for at pillow-heif er installert på serveren, eller eksporter bildet som JPEG."
+        raise ValueError(f"Kunne ikke forberede bildet for AI (type={ct or 'ukjent'}).{extra}") from exc
+
+
+@app.post("/color/analyze-image", response_model=ColorAnalyzeResponse)
+async def color_analyze_image(
+    request: Request,
+    image: UploadFile = File(...),
+    apiKey: str | None = Form(None),
+    productLimit: int = Form(12),
+):
+    """
+    Analyser et bilde (f.eks. ansikt/selfie) med OpenAI og returner strukturert fargeanalyse
+    + konkrete produktforslag (med image_url) fra lokal feed.
+
+    API-nøkkel kan sendes som header `x-openai-key` eller form-felt `apiKey`.
+    """
+    request_id = _get_request_id(request)
+    api_key = _require_openai_api_key(_get_openai_api_key(request, apiKey))
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="image må være et bilde.")
+
+    img_bytes = await image.read()
+    if not img_bytes:
+        raise HTTPException(status_code=400, detail="Tomt bilde.")
+
+    model = os.environ.get("OPENAI_MODEL_VISION", os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
+    client = OpenAI(api_key=api_key)
+
+    # Keep prompt tight and deterministic: return JSON only.
+    system = (
+        "Du er en ekspert på fargeanalyse for klær. "
+        "Svar på norsk. Returner KUN gyldig JSON (ingen markdown). "
+        "Ikke inkluder personidentifiserende info."
+    )
+    user = (
+        "Analyser hudtone/undertone og foreslå en sesong (vår/sommer/høst/vinter) basert på synlige trekk i bildet. "
+        "VIKTIG: Unngå 'default'-svar. Ikke velg 'autumn' med mindre det er tydelige varme/jordnære trekk. "
+        "Sørg for variasjon: ikke gjenta samme farge overalt.\n\n"
+        "Returner et JSON-objekt med nøkler:\n"
+        "- undertone: 'warm'|'cool'|'neutral'\n"
+        "- depth: 'light'|'medium'|'deep'\n"
+        "- contrast: 'low'|'medium'|'high'\n"
+        "- season: 'spring'|'summer'|'autumn'|'winter'\n"
+        "- subseason: en av følgende (12-sesong):\n"
+        "  - spring: 'light_spring'|'true_spring'|'bright_spring'\n"
+        "  - summer: 'light_summer'|'true_summer'|'soft_summer'\n"
+        "  - autumn: 'soft_autumn'|'true_autumn'|'deep_autumn'\n"
+        "  - winter: 'bright_winter'|'true_winter'|'deep_winter'\n"
+        "- season_reason: kort tekst\n"
+        "- season_confidence: tall 0.0-1.0\n"
+        "- best_colors: array (5-7 stk) av {name, hex} med UNIKE hex-verdier\n"
+        "- avoid_colors: array (3-5 stk) av {name, hex} med UNIKE hex-verdier\n"
+        "- notes: array (8-14 stk) av konkrete, nyttige punkt (1 setning hver). Inkluder tips om materialer, mønstre, kontraster, smykker/tilbehør, og “hva du bør prioritere”.\n"
+        "- recommended_outfits: {everyday: array, formal: array}\n"
+        "  - everyday: 4 plagg (overdel, bukse, sko, tilbehør) med UNIKE farger\n"
+        "  - formal: 4 plagg (jakke, skjorte, bukse, sko) med UNIKE farger\n"
+        "  - Hvert element: {item, color_name, color_hex}\n"
+        "  - Bruk farger fra best_colors (eller nært beslektet), ikke samme hex på flere elementer.\n"
+    )
+
+    try:
+        vision_bytes, vision_mime = _bytes_for_openai_vision(img_bytes, image.content_type)
+        data_url = "data:" + vision_mime + ";base64," + base64.b64encode(vision_bytes).decode("utf-8")
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ]
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=8192,
+                response_format={"type": "json_object"},
+            )
+        except BadRequestError:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=8192,
+            )
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            raise RuntimeError("Tomt svar fra OpenAI.")
+        analysis = sanitize_for_json(_parse_json_object_from_llm(text))
+    except Exception as e:
+        logger.exception("color_analyze_image failed request_id=%s", request_id)
+        _remember_error(
+            request_id,
+            {
+                "error_code": "COLOR_ANALYZE_FAILED",
+                "message": "color analyze failed",
+                "details": {"exception": type(e).__name__, "exception_message": str(e)},
+            },
+        )
+        detail = "Bildeanalyse feilet. Sjekk server-loggene."
+        if is_dev_mode():
+            detail = f"{detail} ({type(e).__name__}: {str(e)})"
+        raise HTTPException(status_code=502, detail=detail)
+
+    # Attach products matched to palette.
+    raw_products = load_products(BASE_DIR, limit=60)
+    best_hexes = _extract_best_hexes(analysis if isinstance(analysis, dict) else {})
+    products = _rank_products_by_palette(raw_products, best_hexes, limit=int(productLimit or 12))
+    return {"request_id": request_id, "analysis": analysis, "products": products}
 
 
 @app.exception_handler(AppError)
